@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-knowledge-base-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rag-knowledge-base-api
+  template:
+    metadata:
+      labels:
+        app: rag-knowledge-base-api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/mohit-gupta/rag-knowledge-base-api:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: rag-api-config
+            - secretRef:
+                name: rag-api-secrets
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
