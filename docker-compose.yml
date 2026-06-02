@@ -4,11 +4,14 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     env_file: .env
+    environment:
+      - OPENAI_BASE_URL=http://ollama:11434/v1
     ports:
       - "8080:8080"
     depends_on:
       - postgres
       - redis
+      - ollama
   postgres:
     image: pgvector/pgvector:pg16
     environment:
@@ -24,5 +27,29 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "6379:6379"
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+  ollama-pull-models:
+    image: curlimages/curl:latest
+    container_name: ollama-pull-models
+    depends_on:
+      - ollama
+    entrypoint: >
+      sh -c "
+      echo 'Waiting for Ollama to start...' &&
+      until curl -s http://ollama:11434/api/tags > /dev/null; do sleep 1; done &&
+      echo 'Ollama started!' &&
+      echo 'Pulling llama3...' &&
+      curl -s -X POST http://ollama:11434/api/pull -d '{\"name\": \"llama3\"}' &&
+      echo 'Pulling nomic-embed-text...' &&
+      curl -s -X POST http://ollama:11434/api/pull -d '{\"name\": \"nomic-embed-text\"}' &&
+      echo 'All models pulled successfully!'
+      "
 volumes:
   postgres-data:
+  ollama-data:

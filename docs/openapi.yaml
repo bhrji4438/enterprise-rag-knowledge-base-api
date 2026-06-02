@@ -1,0 +1,302 @@
+openapi: 3.0.3
+info:
+  title: RAG Knowledge Base API
+  version: 1.0.0
+  description: Enterprise-grade document ingestion, vector retrieval, and streamed LLM answers.
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+security:
+  - bearerAuth: []
+paths:
+  /v1/auth/token:
+    post:
+      summary: Issue a JWT for a user or service account
+      description: Returns a signed JWT token containing tenant and role claims for authentication.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - tenantId
+                - email
+                - role
+              properties:
+                tenantId:
+                  type: string
+                  example: "tenant-1"
+                email:
+                  type: string
+                  example: "user@tenant1.com"
+                role:
+                  type: string
+                  enum: [owner, admin, engineer, viewer]
+                  example: "viewer"
+      responses:
+        "200":
+          description: Token successfully issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        "400":
+          description: Invalid request parameters
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /v1/documents:
+    post:
+      summary: Upload a document for ingestion
+      description: Enqueues document for asynchronous ingestion (parse, redact, chunk, embed, index).
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to ingest (PDF, TXT, MD, etc.)
+      responses:
+        "202":
+          description: Accepted for ingestion
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documentId:
+                    type: string
+                    example: "doc-uuid-1234"
+                  status:
+                    type: string
+                    example: "uploaded"
+        "400":
+          description: Invalid upload or invalid tenant permissions
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    get:
+      summary: List tenant documents
+      description: Returns metadata of all indexed and processing documents for the authenticated tenant.
+      responses:
+        "200":
+          description: List of documents
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Document"
+
+  /v1/documents/{id}:
+    get:
+      summary: Get document metadata
+      description: Fetch a specific document's current status and metadata.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+          example: "doc-uuid-1234"
+      responses:
+        "200":
+          description: Document found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Document"
+        "404":
+          description: Document not found or access denied
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      summary: Soft delete document and vectors
+      description: Marks document as deleted and cascades deletions to all chunks and vector indices.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+          example: "doc-uuid-1234"
+      responses:
+        "204":
+          description: Successfully deleted
+        "404":
+          description: Document not found or access denied
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /v1/query:
+    post:
+      summary: Ask a question against indexed knowledge
+      description: Synchronous query endpoint. Returns LLM synthesized answer with semantic citation details.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Answer with citations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        "402":
+          description: Budget exceeded (Payment Required)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: All configured LLM providers unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /v1/query/stream:
+    post:
+      summary: Stream an answer using Server-Sent Events
+      description: Async query endpoint returning chunks of text tokens in real time via Server-Sent Events.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: SSE response stream (text/event-stream)
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: "text/event-stream"
+
+  /v1/usage:
+    get:
+      summary: Get tenant and user usage metrics
+      description: Retrieves input/output token count ledger, prompt cache hits, and calculated cost.
+      responses:
+        "200":
+          description: Usage metrics retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenantId:
+                    type: string
+                    example: "tenant-1"
+                  monthlyBudget:
+                    type: integer
+                    example: 5000000
+                  tokensUsed:
+                    type: integer
+                    example: 48920
+                  costUsd:
+                    type: number
+                    example: 0.1235
+                  cacheHitRate:
+                    type: number
+                    example: 0.35
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          example: "https://ragkb.dev/problems/validation-error"
+        title:
+          type: string
+          example: "Validation failed"
+        status:
+          type: integer
+          example: 400
+        detail:
+          type: string
+          example: "The 'question' field cannot be blank."
+        instance:
+          type: string
+          example: "/v1/query"
+    QueryRequest:
+      type: object
+      required: [question]
+      properties:
+        question:
+          type: string
+          example: "What is the refund policy?"
+        topK:
+          type: integer
+          default: 8
+          example: 8
+    QueryResponse:
+      type: object
+      properties:
+        answer:
+          type: string
+          example: "According to the company policy, you can request a full refund within 30 days of purchase."
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              chunkId:
+                type: string
+                example: "chunk-uuid-1"
+              score:
+                type: number
+                example: 0.892
+    Document:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "doc-uuid-1234"
+        tenantId:
+          type: string
+          example: "tenant-1"
+        title:
+          type: string
+          example: "refund-policy.pdf"
+        status:
+          type: string
+          enum: [uploaded, processing, indexed, failed]
+          example: "indexed"
+        mimeType:
+          type: string
+          example: "application/pdf"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-06-02T12:00:00Z"
