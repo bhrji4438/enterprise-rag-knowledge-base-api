@@ -14,7 +14,7 @@ See `docker-compose.yml`. It runs app, PostgreSQL with pgvector, and Redis.
 
 ## 4. CI/CD Pipeline
 
-GitHub Actions runs lint, tests, coverage, build, image publish, and ArgoCD sync. Production deploys require protected environment approval.
+GitHub Actions runs `npm ci`, TypeScript linting, the Node test harness, production build, and Docker image verification. Image publish and ArgoCD sync should be enabled behind protected environments once registry and cluster credentials are configured.
 
 ## 5. Promotion Strategy
 

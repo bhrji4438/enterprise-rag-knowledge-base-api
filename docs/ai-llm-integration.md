@@ -2,7 +2,7 @@
 
 ## 1. LLM Provider Strategy
 
-Primary: OpenAI for embeddings and chat because of strong ecosystem support in LangChain.js. Fallback: Anthropic for answer synthesis when OpenAI times out or returns provider errors. Model selection uses request intent: cheap summarization uses a small model, high-confidence Q&A uses the configured primary, and JSON extraction uses models with reliable structured output.
+Primary: OpenAI for embeddings and chat through the official OpenAI SDK, wrapped by internal provider interfaces. Fallback: Anthropic for answer synthesis when OpenAI times out or returns provider errors. LangChain.js or LlamaIndex can be added later as optional orchestration adapters, but they are intentionally not installed in the current package set to keep `npm ci` warning-free and provider contracts stable. Model selection uses request intent: cheap summarization uses a small model, high-confidence Q&A uses the configured primary, and JSON extraction uses models with reliable structured output.
 
 ## 2. Prompt Engineering
 

@@ -1,7 +1,7 @@
 # RAG Knowledge Base API
 
-[![Build](https://github.com/mohit-gupta/rag-knowledge-base-api/actions/workflows/ci.yml/badge.svg)](https://github.com/mohit-gupta/rag-knowledge-base-api/actions)
-[![Coverage](https://img.shields.io/badge/coverage-80%25+-brightgreen)](#testing)
+[![Build](https://github.com/bhrji4438/enterprise-rag-knowledge-base-api/actions/workflows/ci.yml/badge.svg)](https://github.com/bhrji4438/enterprise-rag-knowledge-base-api/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-node%20harness-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![Node](https://img.shields.io/badge/node-%3E%3D20.11.0-green)](package.json)
 
@@ -46,10 +46,10 @@ flowchart LR
 | Runtime | Node.js | 20.11+ |
 | Language | TypeScript | 5.6+ strict |
 | API | Express | 4.19+ |
-| AI orchestration | LangChain.js / OpenAI SDK | current |
+| AI integration | OpenAI SDK behind provider interfaces | 5.x |
 | Database | PostgreSQL + pgvector | 16 |
 | Cache/Queues | Redis + BullMQ | Redis 7 / BullMQ 5 |
-| Testing | Jest + Supertest | 29 / 7 |
+| Testing | TypeScript build + Node assertion harness; Supertest planned for integration | Node 20 / 7 |
 | Deployment | Docker + Kubernetes + ArgoCD | production-oriented |
 
 ## AI/LLM Highlights
@@ -74,8 +74,8 @@ flowchart LR
 ## Quick Start
 
 ```bash
-git clone https://github.com/mohit-gupta/rag-knowledge-base-api.git
-cd rag-knowledge-base-api
+git clone https://github.com/bhrji4438/enterprise-rag-knowledge-base-api.git
+cd enterprise-rag-knowledge-base-api
 cp .env.example .env
 npm install
 docker compose up -d postgres redis
@@ -110,11 +110,11 @@ npm run test:coverage
 npm run build
 ```
 
-The target is 80%+ unit coverage and 60%+ integration coverage. LLM-dependent paths use provider interface mocks, not live API calls.
+`npm test` compiles TypeScript and runs the dependency-light unit harness in `tests/run-unit-tests.ts`. `npm run test:coverage` currently aliases the same smoke suite until a coverage provider is introduced. LLM-dependent paths use provider interface mocks, not live API calls.
 
 ## Deployment
 
-Build the image with `docker build -f docker/Dockerfile -t rag-knowledge-base-api .`. Local dependencies run with `docker compose up`. Kubernetes manifests live in [k8s](k8s), and the CI pipeline in [.github/workflows/ci.yml](.github/workflows/ci.yml) is structured for lint, test, build, push image, and GitOps deployment through ArgoCD.
+Build the image with `docker build -f docker/Dockerfile -t rag-knowledge-base-api .`. Local dependencies run with `docker compose up`. Kubernetes manifests live in [k8s](k8s), and the CI pipeline in [.github/workflows/ci.yml](.github/workflows/ci.yml) is structured for install, lint, test, build, and Docker image verification. Image publishing and GitOps deployment can be enabled once registry and ArgoCD credentials are configured.
 
 ## Security
 

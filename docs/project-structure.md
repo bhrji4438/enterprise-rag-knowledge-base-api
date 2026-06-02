@@ -3,7 +3,7 @@
 ```text
 .
 ├── .env.example                  # Annotated configuration contract
-├── .github/workflows/ci.yml       # CI gate: lint, test, build, image
+├── .github/workflows/ci.yml       # CI gate: install, lint, test, build, image
 ├── docker/Dockerfile              # Multi-stage production build
 ├── docker-compose.yml             # Local app, Postgres, Redis
 ├── docs/
@@ -28,7 +28,8 @@
 │   ├── services/                  # Application use cases
 │   └── shared/                    # errors, logging, validation utilities
 └── tests/
-    ├── unit/                      # Jest unit tests with mocks
+    ├── run-unit-tests.ts          # Dependency-light Node test harness
+    ├── unit/                      # Unit specs with Node assert and mocks
     ├── integration/               # API and repository tests
     └── e2e/                       # Full-stack flows
 ```

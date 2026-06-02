@@ -16,6 +16,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - run: npm test -- --coverage
+      - run: npm test
       - run: npm run build
       - run: docker build -f docker/Dockerfile -t rag-knowledge-base-api:${{ github.sha }} .

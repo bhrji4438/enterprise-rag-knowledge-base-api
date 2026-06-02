@@ -2,53 +2,44 @@
 
 ## 1. Strategy
 
-Unit tests cover pure services, policies, prompt building, provider routing, chunking, and RBAC. Integration tests cover API flows with Supertest, test Postgres, and fake LLM adapters. E2E tests run upload -> ingestion -> query against Docker Compose. Contract tests validate OpenAPI examples and RFC 7807 errors.
+Unit tests cover pure services, policies, prompt building, provider routing, chunking, and RBAC. The current repository uses a dependency-light TypeScript + Node assertion harness so CI stays fast and free of deprecated Jest transitive packages. Integration tests will use Supertest, test Postgres, and fake LLM adapters. E2E tests run upload -> ingestion -> query against Docker Compose. Contract tests validate OpenAPI examples and RFC 7807 errors.
 
 ## 2. Coverage Targets
 
-Unit coverage target: 80%+. Integration coverage target: 60%+. Critical paths such as tenant isolation, token budget enforcement, and provider fallback require branch coverage.
+Target state: 80%+ unit coverage and 60%+ integration coverage once a coverage provider is added. Current CI enforces compile correctness and smoke unit coverage through `npm test`. Critical paths such as tenant isolation, token budget enforcement, and provider fallback require branch coverage before production release.
 
 ## 3. Unit Test Examples
 
 ```ts
-import { LlmFacade } from "../../src/infrastructure/llm/llm-facade";
+import assert from "node:assert/strict";
+import { LlmFacade } from "../../src/infrastructure/llm/llm-facade.js";
 
-test("returns cached LLM response before calling providers", async () => {
+export async function testCachedResponsesSkipProviders(): Promise<void> {
   const cached = { content: "cached", model: "gpt", inputTokens: 1, outputTokens: 1, costUsd: 0.001 };
-  const provider = { name: "openai", complete: jest.fn() };
-  const facade = new LlmFacade([provider], budget(), { get: async () => cached, set: jest.fn() });
-  await expect(facade.completeWithFallback(request(), "k")).resolves.toEqual(cached);
-  expect(provider.complete).not.toHaveBeenCalled();
-});
+  const complete = asyncMock(cached);
+  const provider = { name: "openai", complete };
+  const facade = new LlmFacade([provider], budgetPolicy(), { get: async () => cached, set: async () => undefined });
 
-test("falls back to secondary provider on primary failure", async () => {
+  assert.deepEqual(await facade.completeWithFallback(request(), "k"), cached);
+  assert.equal(complete.calls.length, 0);
+}
+
+export async function testFallbackToSecondaryProvider(): Promise<void> {
   const good = { content: "ok", model: "claude", inputTokens: 10, outputTokens: 20, costUsd: 0.01 };
-  const facade = new LlmFacade(
-    [{ name: "openai", complete: jest.fn().mockRejectedValue(new Error("timeout")) }, { name: "anthropic", complete: jest.fn().mockResolvedValue(good) }],
-    budget(),
-    nullCache()
-  );
-  await expect(facade.completeWithFallback(request(), "k")).resolves.toEqual(good);
-});
+  const primary = { name: "openai", complete: asyncMock(new Error("timeout"), true) };
+  const secondary = { name: "anthropic", complete: asyncMock(good) };
+  const facade = new LlmFacade([primary as never, secondary], budgetPolicy(), nullCache());
 
-test("rejects calls when tenant budget is exceeded", async () => {
-  const facade = new LlmFacade([{ name: "openai", complete: jest.fn() }], budget(false), nullCache());
-  await expect(facade.completeWithFallback(request(), "k")).rejects.toThrow();
-});
+  assert.deepEqual(await facade.completeWithFallback(request(), "k"), good);
+  assert.equal(secondary.complete.calls.length, 1);
+}
 
-test("ingestion pipeline runs steps in order", async () => {
+export async function testIngestionPipelineRunsStepsInOrder(): Promise<void> {
   const calls: string[] = [];
   const step = (name: string) => ({ name, execute: async (ctx: unknown) => { calls.push(name); return ctx; } });
   await new IngestionPipeline([step("parse"), step("chunk"), step("embed")]).run(context());
-  expect(calls).toEqual(["parse", "chunk", "embed"]);
-});
-
-test("answer service hashes tenant question and context into a stable cache key", async () => {
-  const llm = { completeWithFallback: jest.fn().mockResolvedValue({ content: "answer" }) };
-  const retrieval = { handle: jest.fn().mockResolvedValue({ hits: [] }) };
-  await new AnswerService(retrieval, llm as never).answer({ tenantId: "t1", userId: "u1", question: "Q?", topK: 3 });
-  expect(llm.completeWithFallback.mock.calls[0][1]).toHaveLength(64);
-});
+  assert.deepEqual(calls, ["parse", "chunk", "embed"]);
+}
 ```
 
 ## 4. Integration Test Examples
@@ -80,4 +71,4 @@ Provider SDKs are never imported in services. Tests mock `LlmProvider`, `Embeddi
 
 ## 6. CI Gate Configuration
 
-Required merge checks: `npm run lint`, `npm test`, `npm run test:coverage`, `npm run build`, Docker image build, and dependency audit.
+Required merge checks: `npm ci`, `npm run lint`, `npm test`, `npm run build`, Docker image build, and production dependency audit. `npm run test:coverage` is reserved for the future coverage provider and currently aliases `npm test`.
