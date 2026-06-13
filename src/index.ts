@@ -3,22 +3,46 @@ import compression from "compression";
 import cors from "cors";
 import helmet from "helmet";
 import pinoHttpModule from "pino-http";
+import jwt from "jsonwebtoken";
 import path from "node:path";
 import fs from "node:fs";
-import jwt from "jsonwebtoken";
+import rateLimit from "express-rate-limit";
+import multer from "multer";
 import { loadConfig } from "./config/env.js";
+import { createDependencies } from "./composition-root.js";
+import { authController } from "./controllers/auth.controller.js";
+import { documentController } from "./controllers/document.controller.js";
+import { queryController } from "./controllers/query.controller.js";
+import { usageController } from "./controllers/usage.controller.js";
+import { healthController } from "./controllers/health.controller.js";
+import { requireRole } from "./shared/middleware/rbac.js";
+import { globalErrorHandler } from "./shared/middleware/error-handler.js";
+import { asyncHandler } from "./shared/middleware/async-handler.js";
 
+// ── Config ─────────────────────────────────────────────────────────────────
 const config = loadConfig();
+
+// ── Process-level error guards ─────────────────────────────────────────────
+process.on("unhandledRejection", (reason) => {
+  console.error("[process] unhandledRejection:", reason);
+  process.exit(1);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[process] uncaughtException:", err);
+  process.exit(1);
+});
+
+// ── Express app ────────────────────────────────────────────────────────────
 const app = express();
 const pinoHttp = pinoHttpModule as unknown as () => express.RequestHandler;
-const JWT_SECRET = "rag-jwt-secret-demo";
 
-// Relax CSP for Swagger assets hosted on unpkg CDN
+// ── Security middleware ────────────────────────────────────────────────────
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
         ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+        // Only relax CSP for the Swagger UI dev route
         "script-src": ["'self'", "'unsafe-inline'", "https://unpkg.com"],
         "style-src": ["'self'", "'unsafe-inline'", "https://unpkg.com"],
         "img-src": ["'self'", "data:", "https://unpkg.com"],
@@ -27,68 +51,133 @@ app.use(
   })
 );
 
-app.use(cors({ origin: true, credentials: true }));
+// CORS — allowlist from config; open in dev if ALLOWED_ORIGINS is empty
+const allowedOrigins = config.ALLOWED_ORIGINS
+  ? config.ALLOWED_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+  : [];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow requests with no origin (curl, Postman, server-to-server)
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.length === 0 && config.NODE_ENV !== "production") {
+        return cb(null, true); // open in dev
+      }
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      cb(new Error(`CORS: origin "${origin}" is not allowed`));
+    },
+    credentials: true,
+  })
+);
+
 app.use(compression());
 app.use(express.json({ limit: "2mb" }));
 app.use(pinoHttp());
 
-// Authentication Middleware
-function authenticate(req: express.Request, res: express.Response, next: express.NextFunction) {
+// ── Rate limiter ───────────────────────────────────────────────────────────
+const apiLimiter = rateLimit({
+  windowMs: config.RATE_LIMIT_WINDOW_SECONDS * 1000,
+  max: config.RATE_LIMIT_MAX_REQUESTS,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Use in-memory store here; swap for RedisStore in production
+  keyGenerator: (req) => {
+    const tenantId = (req as express.Request & { locals?: { tenantId?: string } }).res?.locals?.[
+      "tenantId"
+    ] as string | undefined;
+    return tenantId ?? req.ip ?? "unknown";
+  },
+  message: {
+    type: "https://ragkb.dev/problems/rate-limit-exceeded",
+    title: "Rate limit exceeded",
+    status: 429,
+    detail: `Too many requests. Limit is ${config.RATE_LIMIT_MAX_REQUESTS} per ${config.RATE_LIMIT_WINDOW_SECONDS}s.`,
+  },
+});
+
+app.use("/v1/", apiLimiter);
+
+// ── Authentication middleware ───────────────────────────────────────────────
+function authenticate(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({
-      type: "https://ragkb.dev/problems/unauthorized",
-      title: "Unauthorized",
-      status: 401,
-      detail: "Missing or invalid authorization header. Please obtain a JWT from POST /v1/auth/token first."
-    });
+  if (!authHeader?.startsWith("Bearer ")) {
+    res
+      .status(401)
+      .setHeader("Content-Type", "application/problem+json")
+      .json({
+        type: "https://ragkb.dev/problems/unauthorized",
+        title: "Unauthorized",
+        status: 401,
+        detail: "Missing or invalid Authorization header. Obtain a JWT from POST /v1/auth/token.",
+      });
+    return;
   }
 
   const token = authHeader.split(" ")[1] ?? "";
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as { tenantId: string; role: string; email: string };
-    res.locals.tenantId = decoded.tenantId;
-    res.locals.role = decoded.role;
-    res.locals.email = decoded.email;
+    const decoded = jwt.verify(token, config.JWT_SECRET, {
+      issuer: config.JWT_ISSUER,
+      audience: config.JWT_AUDIENCE,
+    }) as { tenantId: string; role: string; email: string };
+
+    res.locals["tenantId"] = decoded.tenantId;
+    res.locals["role"] = decoded.role;
+    res.locals["email"] = decoded.email;
     next();
-  } catch (err) {
-    return res.status(401).json({
-      type: "https://ragkb.dev/problems/unauthorized",
-      title: "Unauthorized",
-      status: 401,
-      detail: "Invalid or expired JWT token."
-    });
+  } catch {
+    res
+      .status(401)
+      .setHeader("Content-Type", "application/problem+json")
+      .json({
+        type: "https://ragkb.dev/problems/unauthorized",
+        title: "Unauthorized",
+        status: 401,
+        detail: "Invalid or expired JWT token.",
+      });
   }
 }
 
-// Serve OpenAPI Spec
-app.get("/openapi.yaml", (_req, res) => {
-  const yamlPath = path.join(process.cwd(), "docs", "openapi.yaml");
-  if (fs.existsSync(yamlPath)) {
-    res.setHeader("Content-Type", "text/yaml");
-    res.sendFile(yamlPath);
-  } else {
-    res.status(404).send("openapi.yaml not found");
-  }
+// ── File upload middleware ─────────────────────────────────────────────────
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: config.MAX_FILE_SIZE_BYTES },
+  fileFilter: (_req, file, cb) => {
+    const allowed = new Set(["text/plain", "text/markdown", "text/x-markdown"]);
+    if (allowed.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file type: ${file.mimetype}`));
+    }
+  },
 });
 
-// Serve Swagger UI
-app.get("/docs", (_req, res) => {
-  res.setHeader("Content-Type", "text/html");
-  res.send(`
-<!DOCTYPE html>
+// ── Dev-only: OpenAPI spec + Swagger UI ───────────────────────────────────
+if (config.NODE_ENV !== "production") {
+  app.get("/openapi.yaml", (_req, res) => {
+    const yamlPath = path.join(process.cwd(), "docs", "openapi.yaml");
+    if (fs.existsSync(yamlPath)) {
+      res.setHeader("Content-Type", "text/yaml");
+      res.sendFile(yamlPath);
+    } else {
+      res.status(404).send("openapi.yaml not found");
+    }
+  });
+
+  app.get("/docs", (_req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>RAG Knowledge Base API - Swagger UI</title>
   <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
-  <link rel="icon" type="image/png" href="https://unpkg.com/swagger-ui-dist@5/favicon-32x32.png" sizes="32x32" />
-  <style>
-    html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
-    *, *:before, *:after { box-sizing: inherit; }
-    body { margin:0; background: #fafafa; }
-  </style>
+  <style>html{box-sizing:border-box}*,*:before,*:after{box-sizing:inherit}body{margin:0;background:#fafafa}</style>
 </head>
 <body>
   <div id="swagger-ui"></div>
@@ -97,173 +186,107 @@ app.get("/docs", (_req, res) => {
   <script>
     window.onload = () => {
       window.ui = SwaggerUIBundle({
-        url: '/openapi.yaml',
-        dom_id: '#swagger-ui',
-        deepLinking: true,
-        presets: [
-          SwaggerUIBundle.presets.apis,
-          SwaggerUIStandalonePreset
-        ],
-        layout: "BaseLayout",
-        responseInterceptor: (response) => {
-          // If the auth token was successfully retrieved, auto-preauthorize Swagger UI
-          if (response.url.endsWith('/v1/auth/token') && response.status === 200) {
-            const token = response.body.token;
-            if (token) {
-              ui.preauthorizeApiKey("bearerAuth", token);
-              console.log("Automatically authorized Swagger UI with new JWT token.");
-            }
+        url: '/openapi.yaml', dom_id: '#swagger-ui', deepLinking: true,
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        layout: 'BaseLayout',
+        responseInterceptor: (r) => {
+          if (r.url.endsWith('/v1/auth/token') && r.status === 200 && r.body?.token) {
+            ui.preauthorizeApiKey('bearerAuth', r.body.token);
           }
-          return response;
+          return r;
         }
       });
     };
   </script>
 </body>
-</html>
-  `);
-});
+</html>`);
+  });
+}
 
-// Issue JWT Token Route
-app.post("/v1/auth/token", (req, res) => {
-  const { tenantId, email, role } = req.body;
-  if (!tenantId || !email || !role) {
-    return res.status(400).json({
-      type: "https://ragkb.dev/problems/validation-error",
-      title: "Validation failed",
-      status: 400,
-      detail: "tenantId, email, and role are required fields."
+// ── Dependency bootstrap + routes ─────────────────────────────────────────
+export const appPromise = createDependencies().then((deps) => {
+  const auth = authController();
+  const docs = documentController({
+    documentRepository: deps.documentRepository,
+    ingestionQueue: deps.ingestionQueue,
+  });
+  const query = queryController({ answerService: deps.answerService });
+  const usage = usageController({
+    redis: deps.redis,
+    monthlyBudget: config.TENANT_MONTHLY_TOKEN_BUDGET,
+  });
+  const health = healthController({ redis: deps.redis, db: deps.db });
+
+  // ── Health probes (no auth) ────────────────────────────────────────────
+  app.get("/health/live", (req, res) => health.live(req, res));
+  app.get("/health/ready", asyncHandler((req, res) => health.ready(req, res)));
+
+  // ── Auth ───────────────────────────────────────────────────────────────
+  app.post("/v1/auth/token", (req, res) => auth.issueToken(req, res));
+
+  // ── Documents ──────────────────────────────────────────────────────────
+  app.post(
+    "/v1/documents",
+    authenticate,
+    requireRole("owner", "admin", "engineer"),
+    upload.single("file"),
+    asyncHandler((req, res) => docs.upload(req, res))
+  );
+  app.get(
+    "/v1/documents",
+    authenticate,
+    requireRole("owner", "admin", "engineer", "viewer"),
+    asyncHandler((req, res) => docs.list(req, res))
+  );
+  app.get(
+    "/v1/documents/:id",
+    authenticate,
+    requireRole("owner", "admin", "engineer", "viewer"),
+    asyncHandler((req, res) => docs.getById(req, res))
+  );
+  app.delete(
+    "/v1/documents/:id",
+    authenticate,
+    requireRole("owner", "admin"),
+    asyncHandler((req, res) => docs.remove(req, res))
+  );
+
+  // ── Query ──────────────────────────────────────────────────────────────
+  app.post(
+    "/v1/query",
+    authenticate,
+    requireRole("owner", "admin", "engineer", "viewer"),
+    asyncHandler((req, res) => query.query(req, res))
+  );
+  app.post(
+    "/v1/query/stream",
+    authenticate,
+    requireRole("owner", "admin", "engineer", "viewer"),
+    asyncHandler((req, res) => query.stream(req, res))
+  );
+
+  // ── Usage ──────────────────────────────────────────────────────────────
+  app.get(
+    "/v1/usage",
+    authenticate,
+    requireRole("owner", "admin"),
+    asyncHandler((req, res) => usage.getUsage(req, res))
+  );
+
+  // ── Global error handler (must be last) ───────────────────────────────
+  app.use(globalErrorHandler);
+
+  // ── Start server ───────────────────────────────────────────────────────
+  if (config.NODE_ENV !== "test") {
+    app.listen(config.PORT, () => {
+      console.info(`[server] RAG Knowledge Base API listening on port ${config.PORT}`);
+      console.info(`[server] Environment: ${config.NODE_ENV}`);
+      console.info(`[server] Mocks: ${config.USE_MOCKS}`);
     });
   }
 
-  const token = jwt.sign({ tenantId, email, role }, JWT_SECRET, { expiresIn: "1h" });
-  res.status(200).json({ token });
+  return app;
+}).catch((err: unknown) => {
+  console.error("[startup] Failed to initialise dependencies:", err);
+  process.exit(1);
 });
-
-// Upload Document Route
-app.post("/v1/documents", authenticate, (_req, res) => {
-  res.status(202).json({
-    documentId: `doc-${Math.random().toString(36).substring(2, 11)}`,
-    status: "uploaded",
-    tenantId: res.locals.tenantId,
-    uploadedBy: res.locals.email
-  });
-});
-
-// List Documents Route
-app.get("/v1/documents", authenticate, (_req, res) => {
-  res.status(200).json([
-    {
-      id: "doc-uuid-1234",
-      tenantId: res.locals.tenantId,
-      title: "refund-policy.pdf",
-      status: "indexed",
-      mimeType: "application/pdf",
-      createdAt: new Date().toISOString()
-    },
-    {
-      id: "doc-uuid-5678",
-      tenantId: res.locals.tenantId,
-      title: "terms-of-service.md",
-      status: "indexed",
-      mimeType: "text/markdown",
-      createdAt: new Date().toISOString()
-    }
-  ]);
-});
-
-// Get Document Metadata Route
-app.get("/v1/documents/:id", authenticate, (req, res) => {
-  res.status(200).json({
-    id: req.params.id,
-    tenantId: res.locals.tenantId,
-    title: "refund-policy.pdf",
-    status: "indexed",
-    mimeType: "application/pdf",
-    createdAt: new Date().toISOString()
-  });
-});
-
-// Delete Document Route
-app.delete("/v1/documents/:id", authenticate, (_req, res) => {
-  res.status(204).send();
-});
-
-// Synchronous Query Route
-app.post("/v1/query", authenticate, (req, res) => {
-  const { question } = req.body;
-  if (!question) {
-    return res.status(400).json({
-      type: "https://ragkb.dev/problems/validation-error",
-      title: "Validation failed",
-      status: 400,
-      detail: "question is a required field."
-    });
-  }
-
-  res.status(200).json({
-    answer: `This is a simulated RAG response for tenant [${res.locals.tenantId}] (User: ${res.locals.email}, Role: ${res.locals.role}) to your question: "${question}". Based on your indexed documents, the refund policy allows requests within 30 days of purchase.`,
-    citations: [
-      { chunkId: "chunk-uuid-1", score: 0.942 }
-    ]
-  });
-});
-
-// Streaming SSE Query Route
-app.post("/v1/query/stream", authenticate, (req, res) => {
-  const { question } = req.body;
-  if (!question) {
-    return res.status(400).json({
-      type: "https://ragkb.dev/problems/validation-error",
-      title: "Validation failed",
-      status: 400,
-      detail: "question is a required field."
-    });
-  }
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
-  const words = `This is a simulated streamed RAG response for tenant [${res.locals.tenantId}] (User: ${res.locals.email}, Role: ${res.locals.role}) to your question: "${question}". Based on the indexed documents, refunds must be submitted within 30 days of initial purchase.`.split(" ");
-  
-  let i = 0;
-  const interval = setInterval(() => {
-    if (i < words.length) {
-      res.write(`data: ${JSON.stringify({ token: (words[i] ?? "") + " " })}\n\n`);
-      i++;
-    } else {
-      res.write(`data: ${JSON.stringify({ 
-        citations: [{ chunkId: "chunk-uuid-1", score: 0.942 }] 
-      })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      clearInterval(interval);
-      res.end();
-    }
-  }, 100);
-
-  req.on("close", () => {
-    clearInterval(interval);
-  });
-});
-
-// Usage Metrics Route
-app.get("/v1/usage", authenticate, (_req, res) => {
-  res.status(200).json({
-    tenantId: res.locals.tenantId,
-    monthlyBudget: 5000000,
-    tokensUsed: 48920,
-    costUsd: 0.1235,
-    cacheHitRate: 0.35
-  });
-});
-
-app.get("/health/live", (_req, res) => res.status(200).json({ status: "ok" }));
-app.get("/health/ready", (_req, res) => res.status(200).json({ status: "ready" }));
-
-app.listen(config.PORT, () => {
-  console.log(`RAG Knowledge Base API listening on ${config.PORT}`);
-});
-
-
-

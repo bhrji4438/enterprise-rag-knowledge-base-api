@@ -2,7 +2,13 @@
 
 ## Pipeline - Enterprise Integration Pattern
 
-Used for document ingestion where each stage has one job: parse, sanitize, chunk, embed, persist. It appears in `src/services/ingestion/ingestion-pipeline.ts` as `IngestionPipeline`, `IngestionStep`, and `PersistEmbeddingsStep`.
+Used for document ingestion where each stage has one job: sanitize, chunk, embed, persist. It appears in `src/services/ingestion/ingestion-pipeline.ts` as `IngestionPipeline`, `IngestionStep`, and `PersistEmbeddingsStep`, with concrete steps in `src/services/ingestion/steps/`:
+
+| Step | File | Responsibility |
+|---|---|---|
+| `SanitizeStep` | `steps/sanitize.step.ts` | Strips control chars, normalises whitespace and line endings |
+| `ChunkStep` | `steps/chunk.step.ts` | Sentence-boundary splitting (800 tok target, 120 tok overlap) |
+| `PersistEmbeddingsStep` | `ingestion-pipeline.ts` | Embeds chunks, upserts to pgvector, marks document indexed |
 
 ```ts
 export interface IngestionStep {
@@ -27,7 +33,14 @@ It improves testability because each step can be unit tested with a fake context
 
 ## Chain of Responsibility - GoF Behavioral
 
-Used in retrieval where query normalization, embedding, vector search, reranking, and policy filtering can vary independently. It appears in `src/services/retrieval/retrieval-chain.ts` as `BaseRetrievalHandler`.
+Used in retrieval where embedding, vector search, and future reranking/policy stages can vary independently. It appears in `src/services/retrieval/retrieval-chain.ts` as `BaseRetrievalHandler`, with two concrete handlers in `src/services/retrieval/handlers/`:
+
+| Handler | File | Responsibility |
+|---|---|---|
+| `EmbeddingRetrievalHandler` | `handlers/embedding.handler.ts` | Embeds question via `EmbeddingProvider`, attaches vector to request |
+| `VectorSearchHandler` | `handlers/vector-search.handler.ts` | Tenant-scoped cosine KNN via `DrizzleVectorRepository` |
+
+Wired in `composition-root.ts` as: `embeddingHandler.setNext(vectorSearchHandler)`.
 
 ```ts
 export abstract class BaseRetrievalHandler implements RetrievalHandler {
@@ -53,6 +66,16 @@ It lets the system add reranking or tenant policy filtering without rewriting th
 
 Used for LLM, embedding, and vector providers. The same service can run OpenAI plus pgvector locally or OpenAI plus Pinecone in production. It appears in `src/infrastructure/llm/llm-provider.ts` as `LlmProvider` and `EmbeddingProvider`.
 
+Concrete strategies in `src/infrastructure/llm/provider-factory.ts`:
+
+| Strategy | Class | When Used |
+|---|---|---|
+| `OpenAiProvider` | `openai-provider.ts` | Primary LLM (chat + embeddings) |
+| `AnthropicProvider` | `anthropic-provider.ts` | Fallback when OpenAI fails |
+| `MockEmbeddingProvider` | `provider-factory.ts` | `USE_MOCKS=true` — returns correct-dimension synthetic vectors |
+
+`MockEmbeddingProvider` is critical: it prevents vector dimension mismatches in demo mode by returning normalised random vectors matching the configured `EMBEDDING_DIMENSIONS` (default 3072).
+
 ```ts
 export interface LlmProvider {
   readonly name: string;
@@ -75,6 +98,15 @@ This mirrors Mohit's Chargezoom gateway abstraction: one internal contract, mult
 ## Facade - GoF Structural
 
 Used to hide provider fallback, usage accounting, cache lookup, and budget enforcement behind one API. It appears in `src/infrastructure/llm/llm-facade.ts` as `LlmFacade`.
+
+Concrete implementations wired by `composition-root.ts`:
+
+| Interface | Implementation | Location |
+|---|---|---|
+| `PromptCache` | `RedisPromptCache` | `src/infrastructure/cache/redis-prompt-cache.ts` |
+| `TokenBudgetPolicy` | `RedisTokenBudgetPolicy` | `src/infrastructure/budget/token-budget.ts` |
+
+`RedisTokenBudgetPolicy` uses monthly Redis `INCRBY` counters (`token_usage:{tenantId}:{YYYY-MM}`) and throws a `402 Payment Required` problem response when the budget is exceeded. Keys expire after 35 days automatically.
 
 ```ts
 export class LlmFacade {

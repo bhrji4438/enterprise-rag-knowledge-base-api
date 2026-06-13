@@ -48,34 +48,39 @@ sequenceDiagram
   participant C as Client
   participant API as Express API
   participant Q as BullMQ
-  participant W as Ingestion Worker
+  participant W as Ingestion Worker (in-process)
   participant DB as PostgreSQL
-  participant V as Vector Store
+  participant V as pgvector
   participant L as LLM Facade
 
-  C->>API: POST /v1/documents
-  API->>API: Validate JWT, tenant, MIME, size
-  API->>DB: Insert document status=uploaded
-  API->>Q: Enqueue ingestion job
-  API-->>C: 202 Accepted
-  Q->>W: Process job
-  W->>W: Parse, redact PII, chunk
-  W->>L: Generate embeddings
-  W->>DB: Save chunks and audit
-  W->>V: Upsert vectors
-  W->>DB: status=indexed
-  C->>API: POST /v1/query/stream
-  API->>Q: Enqueue answer job
-  API-->>C: SSE token stream
-  Q->>W: Retrieve context
-  W->>V: Similarity search
-  W->>L: Stream answer with citations
-  L-->>C: Tokens via API stream
+  C->>API: POST /v1/documents (multipart/form-data)
+  API->>API: authenticate JWT, requireRole(admin/engineer)
+  API->>API: multer: validate MIME, size limit (10MB)
+  API->>API: SHA-256 checksum deduplication
+  API->>DB: INSERT document status=uploaded
+  API->>Q: enqueue ingestion job {documentId, rawText}
+  API-->>C: 202 Accepted {documentId, status}
+  Q->>W: dequeue job
+  W->>DB: UPDATE status=processing
+  W->>W: SanitizeStep: strip control chars
+  W->>W: ChunkStep: sentence-boundary split (800 tok, 120 overlap)
+  W->>L: EmbeddingProvider.embed(chunks[])
+  W->>DB: DrizzleDocumentRepository.saveChunks()
+  W->>V: DrizzleVectorRepository.upsertEmbeddings()
+  W->>DB: UPDATE status=indexed
+  C->>API: POST /v1/query {question, topK}
+  API->>API: authenticate JWT, requireRole(*)
+  API->>L: EmbeddingRetrievalHandler.process(question)
+  L->>V: VectorSearchHandler: cosine KNN topK
+  V-->>API: hits[]{chunk, score}
+  API->>L: LlmFacade.completeWithFallback()
+  L-->>API: {content, citations}
+  API-->>C: 200 {answer, citations[]}
 ```
 
 ## 4. AI/LLM Integration Architecture
 
-LLM calls sit behind `src/infrastructure/llm/llm-facade.ts`. Embedding runs asynchronously inside ingestion workers; answer generation is queued and streamed so the API hot path does not block on provider latency. Redis caches deterministic prompt/context pairs, token budget policy protects tenants, and fallback providers mirror Chargezoom-style gateway abstraction: one domain contract, multiple external adapters.
+LLM calls sit behind `src/infrastructure/llm/llm-facade.ts`. Embedding runs inside BullMQ ingestion workers (in-process with the API server); answer generation is handled synchronously in `AnswerService` and streamed word-by-word over SSE. Redis caches identical prompt/chunk-ID pairs (`RedisPromptCache`), token budget policy protects tenants via monthly Redis counters (`RedisTokenBudgetPolicy`), and fallback providers mirror a payment-gateway abstraction: one `LlmProvider` interface, multiple external adapters. In demo mode (`USE_MOCKS=true`), `MockEmbeddingProvider` returns synthetic 3072-dimension vectors so the pipeline works without a live embedding API.
 
 ## 5. Database Schema Design
 
@@ -83,14 +88,13 @@ LLM calls sit behind `src/infrastructure/llm/llm-facade.ts`. Embedding runs asyn
 |---|---|---|
 | tenants | id uuid pk, slug text unique, plan, monthly_token_budget | unique(slug) |
 | users | id uuid pk, tenant_id fk, email citext, role enum | unique(tenant_id,email), index tenant_id |
-| documents | id uuid pk, tenant_id fk, title, mime_type, checksum_sha256, status, source_uri, created_by | unique(tenant_id,checksum_sha256), index status |
-| document_chunks | id uuid pk, document_id fk, tenant_id fk, ordinal int, content text, token_count int, metadata jsonb | unique(document_id,ordinal), GIN(metadata) |
-| embeddings | chunk_id uuid pk fk, tenant_id fk, embedding vector(3072), model text | ivfflat/hnsw vector index, index tenant_id |
-| conversations | id uuid pk, tenant_id fk, user_id fk, title | index tenant_id,user_id |
-| messages | id uuid pk, conversation_id fk, role, content, token_count | index conversation_id,created_at |
-| llm_usage | id uuid pk, tenant_id fk, user_id fk, provider, model, input_tokens, output_tokens, cost_usd | index tenant_id,created_at |
+| documents | id uuid pk, tenant_id fk, title, mime_type, checksum_sha256, status, source_uri, created_by | **unique(tenant_id,checksum_sha256)** ✅, index(tenant_id) ✅, index(status) ✅ |
+| document_chunks | id uuid pk, document_id fk cascade, tenant_id fk, ordinal int, content text, token_count int, metadata jsonb, embedding vector(3072) | **HNSW cosine index** ✅, GIN(metadata) ✅, index(tenant_id) ✅, index(document_id) ✅ |
+| llm_usage | id uuid pk, tenant_id fk, user_id fk, provider, model, input_tokens, output_tokens, cost_usd | index tenant_id,created_at — **tracked in Redis until DB table is added** |
 | audit_events | id uuid pk, tenant_id fk, actor_id, action, resource_type, resource_id, metadata jsonb | index tenant_id,created_at |
 | api_keys | id uuid pk, tenant_id fk, key_hash, scopes text[], expires_at | unique key_hash |
+
+> ✅ = implemented in `drizzle/0001_indexes.sql`
 
 ## 6. API Contract Overview
 
